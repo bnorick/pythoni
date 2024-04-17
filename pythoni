@@ -1,0 +1,340 @@
+#!/usr/bin/env python
+
+# MIT License
+
+# Copyright (c) 2024 bnorick
+
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+
+# The above copyright notice and this permission notice shall be included in all
+# copies or substantial portions of the Software.
+
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+
+
+import sys
+if sys.version_info < (3, 4):
+    print(f"ERROR: pythoni requires python 3.4 or later, <3 pathlib.", file=sys.stderr)
+    sys.exit(1)
+
+import argparse
+import code
+import functools
+import inspect
+import logging
+import os
+import pathlib
+import re
+import shlex
+import stat
+import textwrap
+import traceback
+
+logger = logging.getLogger(__name__)
+
+logger_configured = False
+if os.getenv("PYTHONI_DEBUG") is not None:
+    logging.basicConfig(level=logging.DEBUG, format="%(asctime)s - %(levelname)s - %(funcName)s [%(lineno)d] - %(message)s")
+    logger_configured = True
+
+
+class ParserExited(Exception):
+    pass
+
+
+class CommandError(Exception):
+    pass
+
+
+class OrderedNamespace(argparse.Namespace):
+    """ref: https://stackoverflow.com/a/58984657"""
+
+    def __init__(self, **kwargs):
+        self.__dict__["_seen"] = {}
+        self.__dict__["_order"] = [None]
+        self.__dict__["_next_index"] = {}
+        super().__init__(**kwargs)
+
+    def __setattr__(self, attr, value):
+        logger.debug(f"__setattr__ 1 {self._order=} {attr=} {value=}")
+        super().__setattr__(attr, value)
+        logger.debug(f"__setattr__ 2 {self._order=} {attr=} {value=}")
+        if attr in self._seen and self._order[0] is None:
+            # clean up on first repeat arg
+            logger.debug("reseting state")
+            self.__dict__["_seen"].clear()
+            self.__dict__["_order"].clear()
+            self.__dict__["_next_index"].clear()
+
+            index = None
+            if isinstance(value, list):
+                index = self.__dict__["_next_index"].setdefault(attr, 0)
+                self.__dict__["_next_index"][attr] = index + 1
+            self.__dict__["_seen"][attr] = True
+            self.__dict__["_order"].append((attr, index))
+        else:
+            index = None
+            if isinstance(value, list):
+                index = self.__dict__["_next_index"].setdefault(attr, 0)
+                self.__dict__["_next_index"][attr] = index + 1
+            self.__dict__["_seen"][attr] = True
+            self.__dict__["_order"].append((attr, index))
+        logger.debug(f"__setattr__ 3 {self._order=} {attr=} {value=}")
+
+    def ordered(self):
+        logger.debug(f"ordered {self._order=}")
+        if self._order and self._order[0] is None:
+            logger.debug("reseting state")
+            self._order.clear()
+            self._next_index.clear()
+        return ((attr, getattr(self, attr) if index is None else getattr(self, attr)[index]) for attr, index in self._order)
+
+
+class ArgumentParser(argparse.ArgumentParser):
+    def print_help(self, *args, **kwargs):
+        logger.debug(f"print_help prog=%s args=%s kwargs=%s", self.prog, args, kwargs)
+        super().print_help(file=sys.stderr)
+
+    def exit(self, *args, **kwargs):
+        logger.debug("exit prog=%s", self.prog)
+        raise ParserExited
+
+
+def arg_to_code_blocks(arg, value):
+    code_blocks = []
+    if arg == "print":
+        if not isinstance(value, list):
+            value = [value]
+        code_blocks.extend([f"print({p})" for p in value])
+    elif arg == "print_fstring":
+        if not isinstance(value, list):
+            value = [value]
+        for p in value:
+            if not re.fullmatch(r"(?:(?=(\\[\\']|[^']))\1)*", p):
+                print(f"ERROR: invalid --print-fstring, single quotes (') must be properly escaped in \"{p}\"", file=sys.stderr)
+                sys.exit(1)
+            code_blocks.append(f"print(f'{p}')")
+    elif arg == "λ":
+        try:
+            if not value.strip().startswith("lambda"):
+                raise SyntaxError
+            result = eval(value)
+            if not callable(result):
+                raise SyntaxError
+            sig = inspect.signature(result)
+            if len(sig.parameters) != 1:
+                raise RuntimeError(f"invalid --lambda, function must accept a single argument \"{value}\" does not")
+        except Exception as e:
+            if isinstance(e, SyntaxError):
+                message = f"invalid --lambda, must be a valid lambda function but \"{value}\" is not"
+            else:
+                message = str(e)
+            print(f"ERROR: {message}", file=sys.stderr)
+            sys.exit(1)
+        lambda_code = f"""\
+            fn = {value}
+            for line in stdin:
+                result = fn(line)
+                if result:
+                    print(result, end='')
+            """
+        code_blocks.append(textwrap.dedent(lambda_code))
+    elif arg == "code":
+        # read potential path from process substitution
+        if value.startswith("/dev/fd"):
+            with pathlib.Path(value).open("r") as f:
+                code_blocks.append(f.read())
+        elif value:
+            code_blocks.append(value)
+    return code_blocks
+
+
+def _argparse_export(pythoni, args):
+    logger.debug("%s", args)
+    if args.indices is None:
+        args.indices = []
+    pythoni.export(args.path, *args.indices, as_python=args.as_python, input_command=args.input_command, overwrite=args.overwrite, all=args.all)
+
+
+def _argparse_help(pythoni, args):
+    pythoni.command_parser.print_help(file=sys.stderr)
+
+
+def _int_or_range(str):
+    try:
+        start, end = str.split("-")
+        return range(int(start), int(end) + 1)
+    except ValueError:
+        try:
+            val = int(str)
+            return range(val, val + 1)
+        except ValueError:
+            raise argparse.ArgumentError(f"indices must be integers or (inclusive) integer ranges, e.g., N-M")
+
+
+class Pythoni(code.InteractiveConsole):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._history = []
+
+        # NOTE: requires python 3.9
+        self.command_parser = ArgumentParser(
+            usage="%%command ...",
+            description="Use commands prefixed with % to perform magic!\nFor help with a specific command, use %command --help.",
+            exit_on_error=False,
+            add_help=False,
+            formatter_class=argparse.RawDescriptionHelpFormatter,
+        )
+        subparsers = self.command_parser.add_subparsers(title="command", help=argparse.SUPPRESS)
+
+        export = subparsers.add_parser("export", prog="%export", exit_on_error=False)
+        export.add_argument("path", type=pathlib.Path)
+        export.add_argument("indices", type=_int_or_range, nargs="*", help="indices from history to export, integers or (inclusive) integer ranges, e.g., N-M")
+        export.add_argument("-p", "--as-python", action="store_true")
+        export.add_argument("-i", "--input-command", type=str, required=False, help="command to run which is piped into script")
+        export.add_argument("-o", "--overwrite", action="store_true")
+        export.add_argument("-a", "--all", action="store_true")
+        export.set_defaults(func=functools.partial(_argparse_export, self))
+
+        help = subparsers.add_parser("help", prog="%help", exit_on_error=False)
+        help.set_defaults(func=functools.partial(_argparse_help, self))
+
+        self.command_parser.epilog = "Available commands:\n  " + "\n  ".join(subparsers.choices.keys())
+
+        sys.ps1 = "[0] >>> "
+
+    def runsource(self, source, filename="<input>", symbol="single"):
+        logger.debug("runsource %s", source)
+        if source.startswith("%"):
+            try:
+                # self.command_parser._reset()
+                args = self.command_parser.parse_args(shlex.split(source[1:].strip()))
+                args.func(args)
+            except ParserExited:
+                pass
+            except (CommandError, argparse.ArgumentError) as e:
+                self.error(str(e))
+            except Exception as e:
+                self.error(str(e))
+                traceback.print_exc(file=sys.stderr)
+            return False
+        else:
+            result = super().runsource(source, filename=filename, symbol=symbol)
+            if not result:
+                self._history.append("\n".join(self.buffer))
+            sys.ps1 = f"[{len(self._history)}] >>> "
+            sys.ps2 = " " * sys.ps1.index(">") + "... "
+            return result
+
+    def _get_export_code(self, *indices, all=False):
+        if indices and all:
+            self.error(f"Both indices and all=True passed, only use one or the other.")
+            return
+        code = []
+        if all:
+            code.extend(self._history)
+        else:
+            try:
+                for index_range in indices:
+                    for index in index_range:
+                        code.append(self._history[index])
+            except IndexError as e:
+                raise CommandError(f"Nonexistent history index requested, {index=}")
+
+        return "\n\n".join(code)
+
+    def export(self, path, *indices, as_python=False, input_command=None, overwrite=False, all=False):
+        path = pathlib.Path(path)
+        if path.exists() and not overwrite:
+            self.error(f"path exists, pass overwrite=True to overwrite: {path}")
+            return
+
+        code = self._get_export_code(*indices, all=all)
+        if as_python:
+            with path.open("w", encoding="utf8") as f:
+                f.write(code)
+
+            print(f"Exported python script to {path}")
+        else:
+            if 'stdin' in code:
+                code = "import sys\nstdin = sys.stdin.readlines()\n\n" + code
+            if input_command:
+                script = f'#!/usr/bin/env bash\nset -Eeuo pipefail\ntrap exit SIGINT SIGTERM ERR EXIT\nCODE={shlex.quote(code)}\n{input_command} | python -c "$CODE"'
+            else:
+                script = f'#!/usr/bin/env bash\nset -Eeuo pipefail\ntrap exit SIGINT SIGTERM ERR EXIT\nCODE={shlex.quote(code)}\npython -c "$CODE"'
+            with path.open("w", encoding="utf8") as f:
+                f.write(script)
+
+            path.chmod(mode=path.stat().st_mode|stat.S_IRWXU)
+
+            print(f"Exported executable bash script to {path}")
+
+    def error(self, message):
+        print(f"ERROR: {message}", file=sys.stderr)
+
+
+parser = argparse.ArgumentParser("pythoni")
+parser.add_argument("-p", "--print", action="append", nargs="+", help="-p '[CODE]' is a shortcut to execute print([CODE])")
+parser.add_argument("-pf", "--print-fstring", action="append", nargs="+", help="-pf '[INPUT]' is a shortcut to execute print(f'[INPUT]'), single quotes (') must be escaped")
+parser.add_argument("-c", "--code", help="code to execute, may use \"stdin\" local which is a list of lines read from stdin")
+parser.add_argument("-l", "--lambda", help="-l 'lambda line: line.replace(\"foobar\", \"\")' is a shortcut to execute the lambda func for each line and print results which evaluate to True, i.e., returning None will hide a line", dest="λ")
+parser.add_argument("-d", "--debug", action="store_true", help="print debug information useful when developing pythoni")
+args = parser.parse_args(namespace=OrderedNamespace())
+
+if args.debug and not logger_configured:
+    logging.basicConfig(level=logging.DEBUG, format="%(asctime)s - %(levelname)s - %(funcName)s [%(lineno)d] - %(message)s")
+
+# don't print info about unraisables, e.g., when head closes the stdout fd
+# and we have a buffered writer still trying to deal with it
+sys.unraisablehook = lambda *args: None
+
+redirected_out = not sys.stdout.isatty()
+redirected_in = not sys.stdin.isatty()
+
+logger.debug(f"state\n{redirected_out=}\n{redirected_in=}\n{args=}\n{list(args.ordered())=}")
+
+CODE_ARGS = {"print", "print_fstring", "code", "λ"}
+code_blocks = []
+for arg, value in args.ordered():
+    if arg in CODE_ARGS:
+        code_blocks.extend(arg_to_code_blocks(arg, value))
+
+if redirected_in:
+    stdin = sys.stdin.readlines()
+    if not code_blocks:
+        print('stdin read to "stdin" variable\n')
+
+if code_blocks:
+    try:
+        for block in code_blocks:
+            logger.debug(f"running {block=}")
+            exec(block)
+    except BrokenPipeError:
+        if not redirected_out:
+            raise
+elif not redirected_out:
+    # ref: https://github.com/python/cpython/issues/36029#issuecomment-1093968541
+    _stdin = os.dup(0)
+    os.close(0)
+    tty = os.open("/dev/tty", os.O_RDONLY)
+    assert tty == 0
+    import readline
+    import rlcompleter
+    variables = globals().copy()
+    variables.update(locals())
+    readline.set_completer(rlcompleter.Completer(variables).complete)
+    readline.parse_and_bind("tab: complete")
+    pythoni = Pythoni(variables)
+    variables.update(pythoni=pythoni)
+    pythoni.interact()
