@@ -9,7 +9,7 @@ I wanted to solve this problem and boost my own productivity, so I wrote `python
 - Pipe into `pythoni` with no args for an interactive REPL where you can access the local variable `stdin` which contains list of lines (including trailing `\n` characters) which were piped in. (*In the future, from the REPL you will be able to save a subset of the actions you performed in the interactive session as a new script or as a copy-pastable `pythoni` chunk. It's sorta kinda there now, but it's a bit buggy.*)
 
 
-### How to use it.
+### How to use it
 Simple things
 ```
 $ echo -e '1\n2\n3' | pythoni -p '"".join(stdin).rstrip().replace("\n", "-")'
